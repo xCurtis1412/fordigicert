@@ -1,0 +1,166 @@
+---
+- name: Monitoring Log Job
+  hosts:
+    - ryancurtis-test1.digicert.com
+    - ryancurtis-test2.digicert.com
+    - ryancurtis-test3.digicert.com
+    - ryancurtis-test4.digicert.com
+    - ryancurtis-test5.digicert.com
+  gather_facts: true
+
+  vars:
+    log_file: /var/log/ultradns-quiz-madeup.log
+    pattern: "Ultradns quiz application took"
+    sample_size: 20
+    stddev_threshold: 5
+    alert_email: ryancurtis@digicert.com
+    alert_from: ansible@digicert.com
+    smtp_host: smtp.digicert.com
+    smtp_port: 25
+    stats_output_dir: /home/ryancurtis/monitor/logs
+
+  tasks:
+
+    - name: Start Block for rescue
+      block:
+
+       
+        - name: Validate  variables
+          assert:
+            that:
+              - sample_size | int > 0
+              - stddev_threshold | float > 0
+              - log_file is defined
+            fail_msg: "Invalid inputs — sample_size/stddev_threshold must be > 0 and log_file must be set"
+            success_msg: "Input validation passed"
+          tags: [validate]
+
+
+        # Validate log file
+        - name: Verify the log file
+          stat:
+            path: "{{ log_file }}"
+          register: log_stat
+          tags: [validate]
+
+        - name: Fail if log file does not exist
+          fail:
+            msg: "{{ log_file }} does not exist on {{ inventory_hostname }}"
+          when: not log_stat.stat.exists
+          tags: [validate]
+
+        - name: Fail if log file is empty
+          fail:
+            msg: "Log file {{ log_file }} is empty on {{ inventory_hostname }}"
+          when: log_stat.stat.size == 0
+          tags: [validate]
+
+        
+        # Collect values from log
+        - name: Extract last {{ sample_size }} timing values from log
+          shell: >
+            grep "{{ pattern }}" "{{ log_file }}"
+            | tail -n {{ sample_size }}
+            | grep -oP '\d+(?= ms)'
+          register: grep_result
+          tags: [stats]
+
+        - name: Fail if 0 matching lines were found
+          fail:
+            msg: "No lines matching '{{ pattern }}' found in {{ log_file }} on {{ inventory_hostname }}"
+          when: grep_result.stdout_lines | length == 0
+          tags: [stats]
+
+        - name: Python custom module for mean and stddev
+          custom_module: #not really a valid name and would not use in real scenario
+            values: "{{ grep_result.stdout_lines | map('float') | list }}"
+          register: stats
+          tags: [stats]
+
+        
+        # Display results and report
+        - name: host stats report
+          debug:
+            msg: |
+
+              Host      : {{ inventory_hostname }}
+              Timestamp : {{ ansible_date_time.iso8601 }}
+              Mean      : {{ stats.mean }} ms
+              Stddev    : {{ stats.stddev }} ms
+              
+          tags: [stats]
+
+        - name: Check stats output directory exists  remote host #can save file on remote or local host for record keeping
+          file:
+            path: "{{ stats_output_dir }}"
+            state: directory
+            mode: '0755'
+          #delegate_to: localhost
+          tags: [stats]
+
+        - name: Save stats to file
+          lineinfile:
+            path: "{{ stats_output_dir }}/stats.txt"
+            line: "{{ ansible_date_time.iso8601 }},{{ inventory_hostname }},{{ stats.mean }},{{ stats.stddev }}"
+            create: true
+            insertafter: EOF
+        #delegate_to: localhost
+         tags: [stats]
+
+        
+        # EMAIL ALERT
+        - name: Send alert email if stddev is too high
+          mail:
+            host: "{{ smtp_host }}"
+            port: "{{ smtp_port }}"
+            from: "{{ alert_from }}"
+            to: "{{ alert_email }}"
+            subject: "ALERT: on {{ inventory_hostname }}"
+            body: |
+              Application timing alert for {{ inventory_hostname }}
+
+              Timestamp : {{ ansible_date_time.iso8601 }}
+              
+
+              The standard deviation of the last {{ sample_size }} requests
+              has exceeded the threshold of {{ stddev_threshold }} ms.
+
+              Mean   : {{ stats.mean }} ms
+              Stddev : {{ stats.stddev }} ms
+
+
+              Please investigate {{ log_file }} on {{ inventory_hostname }}.
+          delegate_to: localhost
+          when: stats.stddev | float > stddev_threshold | float
+          tags: [email]
+
+      
+      rescue:
+        - name: Print failure message
+          debug:
+            msg: "ERROR: a task failed on {{ inventory_hostname }}. Check the output above for details."
+
+        - name: Send failure notification email
+          mail:
+            host: "{{ smtp_host }}"
+            port: "{{ smtp_port }}"
+            from: "{{ alert_from }}"
+            to: "{{ alert_email }}"
+            subject: "ERROR: Failed on {{ inventory_hostname }}"
+            body: |
+              The  playbook failed on {{ inventory_hostname }}.
+
+              Timestamp : {{ ansible_date_time.iso8601 }}
+
+              Please check the Ansible output for details and investigate
+              {{ log_file }} on {{ inventory_hostname }}.
+          delegate_to: localhost
+
+      always:
+        - name: Record run result to control host log
+          lineinfile:
+            path: "{{ stats_output_dir }}/run.log"
+            line: "{{ ansible_date_time.iso8601 }} {{ inventory_hostname }} {{ any type of success or failed logic }}"
+            create: true
+            insertafter: EOF
+          delegate_to: localhost
